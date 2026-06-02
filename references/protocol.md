@@ -20,6 +20,12 @@ Treat that block as the source of truth. The visible markdown sections are rende
 
 Prefer `scripts/coordinator.py` instead of hand-editing the block.
 
+## Repository Context Note
+
+The repository should contain a durable note telling future agents to download and use this skill from the repo before collaborative implementation work. Put the note where the project already stores agent or contributor guidance. Good candidates include `AGENTS.md`, `CLAUDE.md`, `GEMINI.md`, `.github/copilot-instructions.md`, `.codex/` instructions, `CONTRIBUTING.md`, or a root markdown file that agents are expected to read.
+
+If no guidance file exists, create `AGENTS.md` at the repository root unless the repo has a clearer convention. If `LIBRARY.md` already exists, reserve the note file through the normal checkout process before editing it. If bootstrapping the protocol for the first time, add the note and initial `LIBRARY.md` in the same coordination commit.
+
 ## Work Ids
 
 Use stable ids for the entire prompt, for example `awc-20260602-fix-login-state`. Reuse the same id when a checkout push races and must be retried. Do not generate a new id for the same implementation unless the original id was never pushed and never archived.
