@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Work Coordinator"
+  short_description: "Coordinate concurrent AI coding agents"
+  default_prompt: "Use $agent-work-coordinator to coordinate concurrent implementation work in this repository."
