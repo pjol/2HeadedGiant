@@ -22,6 +22,8 @@ STATE_BEGIN = "<!-- agent-work-coordinator-state"
 STATE_END = "agent-work-coordinator-state -->"
 DEFAULT_LIBRARY = "LIBRARY.md"
 DEFAULT_ARCHIVE = "ARCHIVE.md"
+DEFAULT_STALE_SECONDS = 120
+MAX_CHECKINS = 20
 STOPWORDS = {
     "a",
     "an",
@@ -39,6 +41,23 @@ STOPWORDS = {
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def parse_timestamp(raw: str | None) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+    except ValueError:
+        return None
+
+
+def age_seconds(raw: str | None, now: datetime | None = None) -> int | None:
+    timestamp = parse_timestamp(raw)
+    if not timestamp:
+        return None
+    now = now or datetime.now(timezone.utc)
+    return max(0, int((now - timestamp).total_seconds()))
 
 
 def default_state() -> dict[str, Any]:
@@ -104,6 +123,68 @@ def agent_display(impl: dict[str, Any]) -> str:
     return f"{label} [{agent_uuid}]"
 
 
+def checkin_age(impl: dict[str, Any]) -> int | None:
+    return age_seconds(impl.get("last_checkin_at") or impl.get("started_at"))
+
+
+def is_stale(impl: dict[str, Any], threshold_seconds: int) -> bool:
+    age = checkin_age(impl)
+    return age is not None and age >= threshold_seconds
+
+
+def append_unique(items: list[str], item: str) -> None:
+    if item not in items:
+        items.append(item)
+
+
+def git_result(args: list[str], cwd: Path | None = None) -> subprocess.CompletedProcess[str] | None:
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return None
+
+
+def remote_status(fetch: bool = True, cwd: Path | None = None) -> dict[str, Any]:
+    inside = git_result(["rev-parse", "--is-inside-work-tree"], cwd=cwd)
+    if not inside or inside.returncode != 0 or inside.stdout.strip() != "true":
+        return {"state": "not-git"}
+
+    result: dict[str, Any] = {"state": "unknown"}
+    if fetch:
+        fetched = git_result(["fetch", "--quiet"], cwd=cwd)
+        if not fetched or fetched.returncode != 0:
+            result["fetch_error"] = (fetched.stderr.strip() if fetched else "git executable not found")
+
+    upstream = git_result(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], cwd=cwd)
+    if not upstream or upstream.returncode != 0:
+        result["state"] = "no-upstream"
+        return result
+    result["upstream"] = upstream.stdout.strip()
+
+    local = git_result(["rev-parse", "HEAD"], cwd=cwd)
+    remote = git_result(["rev-parse", "@{u}"], cwd=cwd)
+    if not local or not remote or local.returncode != 0 or remote.returncode != 0:
+        result["state"] = "unknown"
+        return result
+    local_sha = local.stdout.strip()
+    remote_sha = remote.stdout.strip()
+    result["local"] = local_sha
+    result["remote"] = remote_sha
+    if local_sha == remote_sha:
+        result["state"] = "up-to-date"
+        return result
+
+    local_behind = git_result(["merge-base", "--is-ancestor", "HEAD", "@{u}"], cwd=cwd)
+    remote_behind = git_result(["merge-base", "--is-ancestor", "@{u}", "HEAD"], cwd=cwd)
+    if local_behind and local_behind.returncode == 0:
+        result["state"] = "behind"
+    elif remote_behind and remote_behind.returncode == 0:
+        result["state"] = "ahead"
+    else:
+        result["state"] = "diverged"
+    return result
+
+
 def load_state(library_path: Path) -> dict[str, Any]:
     if not library_path.exists():
         return default_state()
@@ -151,9 +232,18 @@ def clean_and_rebuild(state: dict[str, Any]) -> None:
         impl.setdefault("agent_uuid", "")
         impl.setdefault("goal", "")
         impl.setdefault("started_at", utc_now())
+        impl.setdefault("last_checkin_at", impl.get("started_at", utc_now()))
+        impl.setdefault("progress_note", "")
+        impl["checkins"] = list(impl.get("checkins", []))[-MAX_CHECKINS:]
         impl["planned_files"] = normalize_paths(list(impl.get("planned_files", [])))
         impl["completed_files"] = normalize_paths(list(impl.get("completed_files", [])))
         impl["completed_files"] = [path for path in impl["completed_files"] if path in impl["planned_files"]]
+        impl["bumped_files"] = normalize_paths(list(impl.get("bumped_files", [])))
+        impl["bumped_files"] = [
+            path
+            for path in impl["bumped_files"]
+            if path in impl["planned_files"] and path not in impl["completed_files"]
+        ]
 
     normalized_checkouts: dict[str, str] = {}
     for raw_path, owner in list(state["checkouts"].items()):
@@ -195,6 +285,20 @@ def clean_and_rebuild(state: dict[str, Any]) -> None:
         impl["queued"] = [
             path for path in planned if path not in completed and impl["id"] in state["queues"].get(path, [])
         ]
+        impl["bumped_files"] = [path for path in impl.get("bumped_files", []) if path not in impl["checked_out"]]
+
+
+def format_checkins(checkins: list[dict[str, Any]], empty: str = "_None._") -> str:
+    if not checkins:
+        return empty
+    lines: list[str] = []
+    for checkin in checkins[-5:]:
+        at = checkin.get("at", "")
+        note = checkin.get("note", "")
+        files = ", ".join(checkin.get("files", []))
+        suffix = f" (`{files}`)" if files else ""
+        lines.append(f"  - {at}: {note}{suffix}")
+    return "\n".join(lines)
 
 
 def promote_queues(state: dict[str, Any]) -> None:
@@ -213,6 +317,57 @@ def promote_queues(state: dict[str, Any]) -> None:
         else:
             state["queues"].pop(path, None)
     clean_and_rebuild(state)
+
+
+def preempt_stale_blockers(
+    state: dict[str, Any],
+    requester_id: str,
+    files: list[str] | None,
+    threshold_seconds: int,
+) -> list[dict[str, Any]]:
+    clean_and_rebuild(state)
+    implementations = state["implementations"]
+    requester = implementations.get(requester_id)
+    if not requester:
+        raise SystemExit(f"No active implementation with id {requester_id!r}.")
+
+    target_paths = normalize_paths(files) if files else list(requester.get("queued", []))
+    preemptions: list[dict[str, Any]] = []
+    now = utc_now()
+    for path in target_paths:
+        queue = state["queues"].get(path, [])
+        if requester_id not in queue:
+            continue
+        owner_id = state["checkouts"].get(path)
+        if not owner_id or owner_id == requester_id:
+            continue
+        owner = implementations.get(owner_id)
+        if not owner or not is_stale(owner, threshold_seconds):
+            continue
+
+        del state["checkouts"][path]
+        queue = [work_id for work_id in queue if work_id != owner_id]
+        if path in owner.get("planned_files", []) and path not in owner.get("completed_files", []):
+            queue.append(owner_id)
+            bumped = list(owner.get("bumped_files", []))
+            append_unique(bumped, path)
+            owner["bumped_files"] = bumped
+            owner["last_bumped_at"] = now
+        state["queues"][path] = queue
+        preemptions.append(
+            {
+                "path": path,
+                "stale_owner": owner_id,
+                "stale_owner_agent": agent_display(owner),
+                "last_checkin_at": owner.get("last_checkin_at", ""),
+                "age_seconds": checkin_age(owner),
+            }
+        )
+
+    promote_queues(state)
+    for preemption in preemptions:
+        preemption["new_owner"] = state["checkouts"].get(preemption["path"])
+    return preemptions
 
 
 def queue_position(state: dict[str, Any], path: str, work_id: str) -> int | None:
@@ -257,7 +412,9 @@ def render_library(state: dict[str, Any]) -> str:
                 "",
                 f"- Agent: {agent_display(impl)}",
                 f"- Started: {impl.get('started_at', '')}",
+                f"- Last check-in: {impl.get('last_checkin_at', '')}",
                 f"- Goal: {impl.get('goal', '')}",
+                f"- Progress: {impl.get('progress_note', '') or '_None._'}",
                 "- Planned paths:",
                 format_list(impl.get("planned_files", [])),
                 "- Completed paths:",
@@ -273,6 +430,8 @@ def render_library(state: dict[str, Any]) -> str:
             suffix = f" ({position})" if position is not None else ""
             queued_lines.append(f"  - `{path}{suffix}`")
         lines.append("\n".join(queued_lines) if queued_lines else "_None._")
+        lines.extend(["- Bumped paths:", format_list(impl.get("bumped_files", [])), "- Recent check-ins:"])
+        lines.append(format_checkins(impl.get("checkins", [])))
         lines.append("")
 
     lines.extend(["## File Checkouts", ""])
@@ -317,8 +476,10 @@ def archive_entry(impl: dict[str, Any], completed_at: str) -> str:
         "",
         f"- Agent: {agent_display(impl)}",
         f"- Started: {impl.get('started_at', '')}",
+        f"- Last check-in: {impl.get('last_checkin_at', '')}",
         f"- Completed: {completed_at}",
         f"- Goal: {impl.get('goal', '')}",
+        f"- Final progress: {impl.get('progress_note', '') or '_None._'}",
         "- Planned paths:",
         format_list(impl.get("planned_files", [])),
         "- Completed paths:",
@@ -327,6 +488,10 @@ def archive_entry(impl: dict[str, Any], completed_at: str) -> str:
         format_list(impl.get("checked_out", [])),
         "- Queued paths at completion:",
         format_list(impl.get("queued", [])),
+        "- Bumped paths at completion:",
+        format_list(impl.get("bumped_files", [])),
+        "- Recent check-ins:",
+        format_checkins(impl.get("checkins", [])),
         "",
     ]
     return "\n".join(lines)
@@ -386,16 +551,23 @@ def render_status(state: dict[str, Any], candidates: list[dict[str, Any]]) -> st
     if active:
         lines.append("Active implementations:")
         for work_id, impl in sorted(active.items()):
+            last_checkin = impl.get("last_checkin_at", "")
+            last_checkin_age = checkin_age(impl)
+            age_text = f"{last_checkin_age}s ago" if last_checkin_age is not None else "unknown age"
             completed = ", ".join(impl.get("completed_files", [])) or "none"
             checked = ", ".join(impl.get("checked_out", [])) or "none"
+            bumped = ", ".join(impl.get("bumped_files", [])) or "none"
             queued = []
             for path in impl.get("queued", []):
                 position = queue_position(state, path, work_id)
                 queued.append(f"{path} ({position})" if position else path)
             lines.append(f"- {work_id} by {agent_display(impl)}: {impl.get('goal', '')}")
+            lines.append(f"  last check-in: {last_checkin or 'none'} ({age_text})")
+            lines.append(f"  progress: {impl.get('progress_note', '') or 'none'}")
             lines.append(f"  completed: {completed}")
             lines.append(f"  checked out: {checked}")
             lines.append(f"  queued: {', '.join(queued) or 'none'}")
+            lines.append(f"  bumped: {bumped}")
     else:
         lines.append("No active implementations.")
     if candidates:
@@ -461,8 +633,18 @@ def cmd_request(args: argparse.Namespace) -> int:
             "agent_uuid": requested_agent_uuid or make_agent_uuid(),
             "goal": args.goal,
             "started_at": utc_now(),
+            "last_checkin_at": utc_now(),
+            "progress_note": "checkout requested",
+            "checkins": [
+                {
+                    "at": utc_now(),
+                    "note": "checkout requested",
+                    "files": files,
+                }
+            ],
             "planned_files": files,
             "completed_files": [],
+            "bumped_files": [],
             "checked_out": [],
             "queued": [],
         }
@@ -498,7 +680,9 @@ def cmd_request(args: argparse.Namespace) -> int:
         "agent": result_impl["agent"],
         "agent_uuid": result_impl["agent_uuid"],
         "goal": result_impl["goal"],
+        "last_checkin_at": result_impl.get("last_checkin_at", ""),
         "completed_files": result_impl.get("completed_files", []),
+        "bumped_files": result_impl.get("bumped_files", []),
         "checked_out": result_impl.get("checked_out", []),
         "queued": [
             {"path": path, "position": queue_position(state, path, work_id)}
@@ -506,6 +690,84 @@ def cmd_request(args: argparse.Namespace) -> int:
         ],
     }
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_checkin(args: argparse.Namespace) -> int:
+    library_path = Path(args.library)
+    current_remote_status = remote_status(fetch=not args.skip_fetch, cwd=library_path.resolve().parent)
+    if current_remote_status.get("state") in {"behind", "diverged"} and not args.allow_remote_moved:
+        print(
+            json.dumps(
+                {
+                    "status": "remote-moved",
+                    "remote": current_remote_status,
+                    "action": "Sync the branch, inspect LIBRARY.md for bumped files, then rerun checkin.",
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        return 2
+
+    files = normalize_paths(args.files or []) if args.files else []
+    state = load_state(library_path)
+    promote_queues(state)
+    impl = state["implementations"].get(args.id)
+    if not impl:
+        raise SystemExit(f"No active implementation with id {args.id!r}.")
+    planned = set(impl.get("planned_files", []))
+    for path in files:
+        if path not in planned:
+            raise SystemExit(f"{path!r} is not planned for implementation {args.id!r}.")
+
+    now = utc_now()
+    impl["last_checkin_at"] = now
+    impl["progress_note"] = args.note
+    checkins = list(impl.get("checkins", []))
+    checkins.append(
+        {
+            "at": now,
+            "note": args.note,
+            "files": files,
+            "checked_out": impl.get("checked_out", []),
+            "queued": impl.get("queued", []),
+            "bumped": impl.get("bumped_files", []),
+            "remote_state": current_remote_status.get("state", "unknown"),
+        }
+    )
+    impl["checkins"] = checkins[-MAX_CHECKINS:]
+    impl["updated_at"] = now
+    promote_queues(state)
+    save_library(library_path, state)
+    result_impl = state["implementations"][args.id]
+    bumped = result_impl.get("bumped_files", [])
+    print(
+        json.dumps(
+            {
+                "id": args.id,
+                "agent": result_impl.get("agent", "agent"),
+                "agent_uuid": result_impl.get("agent_uuid", ""),
+                "last_checkin_at": result_impl.get("last_checkin_at", ""),
+                "progress_note": result_impl.get("progress_note", ""),
+                "completed_files": result_impl.get("completed_files", []),
+                "checked_out": result_impl.get("checked_out", []),
+                "queued": [
+                    {"path": path, "position": queue_position(state, path, args.id)}
+                    for path in result_impl.get("queued", [])
+                ],
+                "bumped_files": bumped,
+                "remote": current_remote_status,
+                "action": (
+                    "Discard local changes for bumped files and wait for normal queue promotion."
+                    if bumped
+                    else "Continue work on checked-out files."
+                ),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -545,6 +807,20 @@ def cmd_release(args: argparse.Namespace) -> int:
 
     impl["completed_files"] = completed
     impl["updated_at"] = utc_now()
+    impl["last_checkin_at"] = impl["updated_at"]
+    impl["progress_note"] = f"released completed files: {', '.join(released) or 'none'}"
+    checkins = list(impl.get("checkins", []))
+    checkins.append(
+        {
+            "at": impl["updated_at"],
+            "note": impl["progress_note"],
+            "files": released,
+            "checked_out": impl.get("checked_out", []),
+            "queued": impl.get("queued", []),
+            "bumped": impl.get("bumped_files", []),
+        }
+    )
+    impl["checkins"] = checkins[-MAX_CHECKINS:]
     promote_queues(state)
     save_library(library_path, state)
     result_impl = state["implementations"][args.id]
@@ -559,6 +835,33 @@ def cmd_release(args: argparse.Namespace) -> int:
                 "queued": [
                     {"path": path, "position": queue_position(state, path, args.id)}
                     for path in result_impl.get("queued", [])
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    return 0
+
+
+def cmd_preempt_stale(args: argparse.Namespace) -> int:
+    files = normalize_paths(args.files or []) if args.files else None
+    library_path = Path(args.library)
+    state = load_state(library_path)
+    promote_queues(state)
+    preemptions = preempt_stale_blockers(state, args.id, files, args.threshold_seconds)
+    save_library(library_path, state)
+    impl = state["implementations"].get(args.id, {})
+    print(
+        json.dumps(
+            {
+                "id": args.id,
+                "threshold_seconds": args.threshold_seconds,
+                "preemptions": preemptions,
+                "checked_out": impl.get("checked_out", []),
+                "queued": [
+                    {"path": path, "position": queue_position(state, path, args.id)}
+                    for path in impl.get("queued", [])
                 ],
             },
             indent=2,
@@ -591,6 +894,20 @@ def cmd_finish(args: argparse.Namespace) -> int:
         if not state["queues"][path]:
             del state["queues"][path]
     impl["completed_files"] = completed
+    impl["last_checkin_at"] = utc_now()
+    impl["progress_note"] = "finished implementation"
+    checkins = list(impl.get("checkins", []))
+    checkins.append(
+        {
+            "at": impl["last_checkin_at"],
+            "note": impl["progress_note"],
+            "files": completed,
+            "checked_out": [],
+            "queued": impl.get("queued", []),
+            "bumped": impl.get("bumped_files", []),
+        }
+    )
+    impl["checkins"] = checkins[-MAX_CHECKINS:]
     promote_queues(state)
     archived_impl = copy.deepcopy(impl)
     del state["implementations"][args.id]
@@ -613,6 +930,15 @@ def cmd_wait(args: argparse.Namespace) -> int:
         if not impl:
             print(json.dumps({"id": args.id, "status": "not-active"}, indent=2))
             return 0
+        preemptions: list[dict[str, Any]] = []
+        if args.preempt_stale:
+            preemptions = preempt_stale_blockers(state, args.id, None, args.threshold_seconds)
+            if preemptions:
+                save_library(library_path, state)
+                impl = state["implementations"].get(args.id)
+                if not impl:
+                    print(json.dumps({"id": args.id, "status": "not-active"}, indent=2))
+                    return 0
         queued = set(impl.get("queued", []))
         checked = set(impl.get("checked_out", []))
         if initial_queued is None:
@@ -626,11 +952,13 @@ def cmd_wait(args: argparse.Namespace) -> int:
                         "agent": impl.get("agent", "agent"),
                         "agent_uuid": impl.get("agent_uuid", ""),
                         "completed_files": impl.get("completed_files", []),
+                        "bumped_files": impl.get("bumped_files", []),
                         "checked_out": impl.get("checked_out", []),
                         "queued": [
                             {"path": path, "position": queue_position(state, path, args.id)}
                             for path in impl.get("queued", [])
                         ],
+                        "preemptions": preemptions,
                     },
                     indent=2,
                     sort_keys=True,
@@ -660,10 +988,33 @@ def build_parser() -> argparse.ArgumentParser:
     request.add_argument("--files", nargs="+", required=True, help="Repo-relative files to reserve")
     request.set_defaults(func=cmd_request)
 
+    checkin = subparsers.add_parser("checkin", help="Record progress and verify remote/check-out state")
+    checkin.add_argument("--id", required=True, help="Work id checking in")
+    checkin.add_argument("--note", required=True, help="Short progress note")
+    checkin.add_argument("--files", nargs="*", help="Planned files this note concerns")
+    checkin.add_argument("--skip-fetch", action="store_true", help="Do not fetch remote before checking in")
+    checkin.add_argument(
+        "--allow-remote-moved",
+        action="store_true",
+        help="Write the checkin even if the upstream branch has moved",
+    )
+    checkin.set_defaults(func=cmd_checkin)
+
     release = subparsers.add_parser("release", help="Release completed checked-out files and promote queues")
     release.add_argument("--id", required=True, help="Work id releasing files")
     release.add_argument("--files", nargs="+", required=True, help="Checked-out files completed by this work id")
     release.set_defaults(func=cmd_release)
+
+    preempt = subparsers.add_parser("preempt-stale", help="Move stale checkout owners to the back of queues")
+    preempt.add_argument("--id", required=True, help="Queued work id requesting stale preemption")
+    preempt.add_argument("--files", nargs="*", help="Queued files to consider. Defaults to all queued files.")
+    preempt.add_argument(
+        "--threshold-seconds",
+        type=int,
+        default=DEFAULT_STALE_SECONDS,
+        help="Seconds since last checkin before a checkout is stale",
+    )
+    preempt.set_defaults(func=cmd_preempt_stale)
 
     finish = subparsers.add_parser("finish", help="Release active work and append it to ARCHIVE.md")
     finish.add_argument("--archive", default=DEFAULT_ARCHIVE, help="Path to ARCHIVE.md")
@@ -674,6 +1025,13 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--id", required=True, help="Work id to wait for")
     wait.add_argument("--interval", type=float, default=10.0, help="Polling interval in seconds")
     wait.add_argument("--pull", action="store_true", help="Run git pull --ff-only before each check")
+    wait.add_argument("--preempt-stale", action="store_true", help="Preempt stale checkout owners while waiting")
+    wait.add_argument(
+        "--threshold-seconds",
+        type=int,
+        default=DEFAULT_STALE_SECONDS,
+        help="Seconds since last checkin before a checkout is stale",
+    )
     wait.set_defaults(func=cmd_wait)
 
     return parser

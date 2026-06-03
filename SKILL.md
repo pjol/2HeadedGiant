@@ -1,6 +1,6 @@
 ---
 name: agent-work-coordinator
-description: Coordinate two or more humans or AI agents implementing changes concurrently in the same Git codebase. Use before feature work, bug fixes, refactors, or any multi-file implementation where agents need to reserve repo-relative files, add a repository context note telling other agents to download and use this skill, avoid duplicate work, queue behind active checkouts in LIBRARY.md, release completed file checkouts immediately, poll for freed files without interrupting the user, and archive completed implementation briefs in ARCHIVE.md.
+description: Coordinate two or more humans or AI agents implementing changes concurrently in the same Git codebase. Use before feature work, bug fixes, refactors, or any multi-file implementation where agents need to reserve repo-relative files, add a repository context note telling other agents to download and use this skill, avoid duplicate work, queue behind active checkouts in LIBRARY.md, record at-least-once-per-minute check-ins, preempt stale checkouts, release completed file checkouts immediately, poll for freed files without interrupting the user, and archive completed implementation briefs in ARCHIVE.md.
 ---
 
 # Agent Work Coordinator
@@ -16,6 +16,9 @@ Prefer `scripts/coordinator.py` for all `LIBRARY.md` and `ARCHIVE.md` edits. It 
 - Do not implement a feature until the checkout request for its available files has been committed and pushed.
 - Do not edit a file unless it is listed under your implementation's checked-out paths in `LIBRARY.md`.
 - Do not hold a checkout after implementation for that file is complete. Release completed files, commit them, and push immediately so queued agents can proceed.
+- Check in at least once every 60 seconds while holding any checkout. Check-ins must include a progress note, update `last_checkin_at`, check whether the remote branch moved, and be committed and pushed.
+- Treat a checkout as stale when its owner has not checked in for at least 120 seconds. Queued agents may preempt stale owners, move them to the end of the queue for that file, and take the file when promoted.
+- If your own checked-out file is bumped because your session went stale, discard local changes for that file only, stop editing it, and treat it like any other queued file. Redo the implementation after the file is checked out again.
 - Ensure the repository has a durable context note telling future agents to download and use this skill for collaborative work.
 - Treat the human-readable agent label as non-unique. Each active implementation must also carry an on-the-spot generated `agent_uuid`, created by `scripts/coordinator.py`, so overlapping models or default labels do not collide.
 - Before requesting checkouts, inspect active implementation briefs. If another brief is doing the same requested work, stop and tell the user which brief and paths are already claimed. This is the only workflow-coordination reason to return to the user.
@@ -73,7 +76,18 @@ git push
 If this push fails because the remote moved, restore the local `LIBRARY.md` changes from that failed coordination attempt, pull, rerun the request command with the same work id, then commit and push again. At this stage there should be no implementation edits to wipe.
 
 6. Implement only files that the request command reports as checked out. Leave queued files untouched.
-7. As soon as a checked-out file, or a small coherent set of checked-out files, is implementation-complete, release it and push it immediately:
+7. While implementing, check in at least once every minute:
+
+```bash
+python3 /path/to/agent-work-coordinator/scripts/coordinator.py checkin --id "<work-id>" --note "<brief progress note>" --files path/to/current-file
+git add LIBRARY.md
+git commit -m "coord: checkin <work-id>"
+git push
+```
+
+If `checkin` reports `remote-moved`, pause implementation, sync the branch, inspect the updated `LIBRARY.md`, and rerun `checkin`. If it reports `bumped_files`, discard local changes for only those paths, such as with `git restore -- path/to/bumped-file`, then wait in the normal queue and redo that file after it is checked out again.
+
+8. As soon as a checked-out file, or a small coherent set of checked-out files, is implementation-complete, release it and push it immediately:
 
 ```bash
 python3 /path/to/agent-work-coordinator/scripts/coordinator.py release --id "<work-id>" --files path/to/completed-file
@@ -84,15 +98,26 @@ git push
 
 This marks the path complete for your implementation, removes your checkout, promotes the first queued work id for that file, and keeps your active brief open for remaining files. If the push fails because the remote moved, preserve implementation edits, pull or rebase according to repo policy, rerun `release --id "<work-id>" --files ...` on the updated `LIBRARY.md`, then push.
 
-8. If checked-out files are released and queued files remain, sync the branch and rerun the same request command. If no implementation work is currently available, poll without returning to the user:
+9. If checked-out files are released and queued files remain, sync the branch and rerun the same request command. If no implementation work is currently available, poll without returning to the user and allow stale-checkout preemption:
 
 ```bash
-python3 /path/to/agent-work-coordinator/scripts/coordinator.py wait --id "<work-id>" --interval 10 --pull
+python3 /path/to/agent-work-coordinator/scripts/coordinator.py wait --id "<work-id>" --interval 10 --pull --preempt-stale --threshold-seconds 120
 ```
 
-After a queued path is promoted to checked out, commit and push the updated `LIBRARY.md`, then implement that path.
+After a queued path is promoted to checked out or a stale owner is preempted, commit and push the updated `LIBRARY.md`, then implement only paths checked out to your work id.
 
-9. When the entire implementation is complete and all completed files have already been released and pushed, run finish:
+10. A queued agent can also explicitly preempt stale blockers before waiting:
+
+```bash
+python3 /path/to/agent-work-coordinator/scripts/coordinator.py preempt-stale --id "<work-id>" --threshold-seconds 120
+git add LIBRARY.md
+git commit -m "coord: preempt stale checkout for <work-id>"
+git push
+```
+
+This only affects files where the requesting work id is already queued and the current checkout owner has missed check-ins for at least 120 seconds.
+
+11. When the entire implementation is complete and all completed files have already been released and pushed, run finish:
 
 ```bash
 python3 /path/to/agent-work-coordinator/scripts/coordinator.py finish --id "<work-id>"
@@ -100,7 +125,7 @@ python3 /path/to/agent-work-coordinator/scripts/coordinator.py finish --id "<wor
 
 This removes the active brief, releases any remaining checked-out or queued paths for that work id, promotes first queued requests for released files, and appends the completed brief to `ARCHIVE.md`.
 
-10. Commit and push the final `LIBRARY.md` and `ARCHIVE.md` update:
+12. Commit and push the final `LIBRARY.md` and `ARCHIVE.md` update:
 
 ```bash
 git add LIBRARY.md ARCHIVE.md

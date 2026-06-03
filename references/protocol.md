@@ -69,9 +69,24 @@ Final-stage race:
 
 Do not use destructive whole-repo resets for this protocol.
 
+Check-in remote movement:
+
+1. Run `checkin --id <work-id> --note <note>` at least once every 60 seconds.
+2. The command fetches remote state by default and refuses to write a check-in when the upstream branch is ahead or diverged.
+3. If the check-in reports `remote-moved`, sync the branch, inspect whether any checked-out files were bumped, and rerun check-in.
+4. If bumped files are reported, discard local changes only for those paths and treat them as queued work.
+
 ## Polling
 
-When no checked-out work remains and only queued paths are left, poll every 10 seconds. Pull the latest branch state before or during polling according to repo policy. Do not return to the user simply because the work is queued.
+When no checked-out work remains and only queued paths are left, poll every 10 seconds. Pull the latest branch state before or during polling according to repo policy. Use `wait --preempt-stale --threshold-seconds 120` or `preempt-stale` so stale checkouts do not block the queue indefinitely. Do not return to the user simply because the work is queued.
+
+## Check-ins And Stale Preemption
+
+Each active implementation stores `last_checkin_at`, `progress_note`, recent `checkins`, and `bumped_files`. Check in at least once every 60 seconds while holding checkouts. Commit and push the resulting `LIBRARY.md` update so other agents can see the heartbeat.
+
+A checkout is stale after 120 seconds without a check-in. A queued implementation may preempt stale blockers with `preempt-stale --id <queued-work-id>`. Preemption removes the stale owner's checkout, appends the stale owner to the end of that file's queue, records the path under the stale owner's `bumped_files`, and promotes the next queued work id.
+
+When an agent sees one of its paths under `bumped_files`, it must discard local changes for that path only, stop editing it, and wait for the path to be checked out again. Use targeted restoration such as `git restore -- path/to/file`; do not reset the whole repo.
 
 ## Incremental File Release
 
@@ -88,5 +103,7 @@ If a manual repair is unavoidable:
 - Releasing a checkout promotes the first queued work id for that path.
 - Removing a queued work id causes later positions to move down.
 - Completed files remain in the active brief as `completed_files` until the implementation is archived.
+- Stale preemption moves a stale checkout owner to the end of that file's queue and records the path under `bumped_files`.
+- A bumped owner must not keep local edits for the bumped file.
 - A completed implementation must have no entries remaining in active briefs, checkouts, or queues.
 - Archive completed work at the end of `ARCHIVE.md` with the completion timestamp.
