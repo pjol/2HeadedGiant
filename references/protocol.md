@@ -30,6 +30,12 @@ If no guidance file exists, create `AGENTS.md` at the repository root unless the
 
 Use stable ids for the entire prompt, for example `awc-20260602-fix-login-state`. Reuse the same id when a checkout push races and must be retried. Do not generate a new id for the same implementation unless the original id was never pushed and never archived.
 
+## Agent Instance Ids
+
+Human-readable agent labels are not unique. `scripts/coordinator.py request` generates an `agent_uuid` for each implementation and stores it beside the label. Rendered checkouts and queues should show both the work id and `agent label [agent_uuid]`.
+
+When rerunning `request` for an implementation that already exists in `LIBRARY.md`, preserve the existing `agent_uuid`. Use `--agent-uuid` only when retrying a checkout attempt where the UUID was generated and captured locally but not yet persisted because the push raced.
+
 ## Duplicate Work Check
 
 Before reserving files, read all active briefs. Compare the user's requested outcome, not just file overlap. Stop and report to the user only when another active brief is already implementing the same outcome.
@@ -46,6 +52,14 @@ Checkout-stage race:
 4. `git push`
 5. If push is rejected because the remote moved, restore only the local coordination-file changes from the failed attempt, pull, rerun `request` with the same work id, recommit, and push.
 
+Per-file release race:
+
+1. Finish implementation for the checked-out file or coherent file set.
+2. Run `release --id <work-id> --files <paths...>`.
+3. Commit the completed file changes together with `LIBRARY.md`.
+4. `git push`
+5. If push is rejected because the remote moved, preserve implementation edits, pull or rebase according to repo policy, rerun `release` on the updated `LIBRARY.md`, recommit if needed, and push.
+
 Final-stage race:
 
 1. Preserve implementation edits.
@@ -59,6 +73,12 @@ Do not use destructive whole-repo resets for this protocol.
 
 When no checked-out work remains and only queued paths are left, poll every 10 seconds. Pull the latest branch state before or during polling according to repo policy. Do not return to the user simply because the work is queued.
 
+## Incremental File Release
+
+Release a checkout as soon as the implementation for that file is complete. Do not wait for unrelated files in the same implementation. `scripts/coordinator.py release` records the file under `completed_files`, removes the checkout, promotes the first queued work id for that path, and keeps the active brief open.
+
+After `release`, commit and push the completed file changes with `LIBRARY.md` immediately. This shortens the time that other agents spend blocked in the queue.
+
 ## Manual Queue Rules
 
 If a manual repair is unavoidable:
@@ -67,5 +87,6 @@ If a manual repair is unavoidable:
 - Queue entries are ordered by wait position.
 - Releasing a checkout promotes the first queued work id for that path.
 - Removing a queued work id causes later positions to move down.
+- Completed files remain in the active brief as `completed_files` until the implementation is archived.
 - A completed implementation must have no entries remaining in active briefs, checkouts, or queues.
 - Archive completed work at the end of `ARCHIVE.md` with the completion timestamp.

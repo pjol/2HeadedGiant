@@ -1,6 +1,6 @@
 ---
 name: agent-work-coordinator
-description: Coordinate two or more humans or AI agents implementing changes concurrently in the same Git codebase. Use before feature work, bug fixes, refactors, or any multi-file implementation where agents need to reserve repo-relative files, add a repository context note telling other agents to download and use this skill, avoid duplicate work, queue behind active checkouts in LIBRARY.md, poll for freed files without interrupting the user, and archive completed implementation briefs in ARCHIVE.md.
+description: Coordinate two or more humans or AI agents implementing changes concurrently in the same Git codebase. Use before feature work, bug fixes, refactors, or any multi-file implementation where agents need to reserve repo-relative files, add a repository context note telling other agents to download and use this skill, avoid duplicate work, queue behind active checkouts in LIBRARY.md, release completed file checkouts immediately, poll for freed files without interrupting the user, and archive completed implementation briefs in ARCHIVE.md.
 ---
 
 # Agent Work Coordinator
@@ -15,7 +15,9 @@ Prefer `scripts/coordinator.py` for all `LIBRARY.md` and `ARCHIVE.md` edits. It 
 
 - Do not implement a feature until the checkout request for its available files has been committed and pushed.
 - Do not edit a file unless it is listed under your implementation's checked-out paths in `LIBRARY.md`.
+- Do not hold a checkout after implementation for that file is complete. Release completed files, commit them, and push immediately so queued agents can proceed.
 - Ensure the repository has a durable context note telling future agents to download and use this skill for collaborative work.
+- Treat the human-readable agent label as non-unique. Each active implementation must also carry an on-the-spot generated `agent_uuid`, created by `scripts/coordinator.py`, so overlapping models or default labels do not collide.
 - Before requesting checkouts, inspect active implementation briefs. If another brief is doing the same requested work, stop and tell the user which brief and paths are already claimed. This is the only workflow-coordination reason to return to the user.
 - Treat paths as repo-root-relative paths. Do not use absolute paths in the library.
 - Handle planning, checkout, queue waiting, and release inside the same user prompt without asking the user to approve coordination mechanics.
@@ -58,6 +60,8 @@ Use judgment on similar-work warnings. Stop only when an active brief is substan
 python3 /path/to/agent-work-coordinator/scripts/coordinator.py request --id "<work-id>" --agent "<agent-name>" --goal "<brief goal>" --files path/to/file another/file
 ```
 
+The `--agent` value is only a readable label. The coordinator generates and persists an `agent_uuid` for the implementation unless `--agent-uuid` is explicitly supplied for a retry that must preserve an already generated identity.
+
 5. Commit and push the coordination checkout before implementation:
 
 ```bash
@@ -69,7 +73,18 @@ git push
 If this push fails because the remote moved, restore the local `LIBRARY.md` changes from that failed coordination attempt, pull, rerun the request command with the same work id, then commit and push again. At this stage there should be no implementation edits to wipe.
 
 6. Implement only files that the request command reports as checked out. Leave queued files untouched.
-7. If checked-out files are finished but queued files remain, sync the branch and rerun the same request command. If no implementation work is currently available, poll without returning to the user:
+7. As soon as a checked-out file, or a small coherent set of checked-out files, is implementation-complete, release it and push it immediately:
+
+```bash
+python3 /path/to/agent-work-coordinator/scripts/coordinator.py release --id "<work-id>" --files path/to/completed-file
+git add path/to/completed-file LIBRARY.md
+git commit -m "<implementation summary for completed file>"
+git push
+```
+
+This marks the path complete for your implementation, removes your checkout, promotes the first queued work id for that file, and keeps your active brief open for remaining files. If the push fails because the remote moved, preserve implementation edits, pull or rebase according to repo policy, rerun `release --id "<work-id>" --files ...` on the updated `LIBRARY.md`, then push.
+
+8. If checked-out files are released and queued files remain, sync the branch and rerun the same request command. If no implementation work is currently available, poll without returning to the user:
 
 ```bash
 python3 /path/to/agent-work-coordinator/scripts/coordinator.py wait --id "<work-id>" --interval 10 --pull
@@ -77,19 +92,19 @@ python3 /path/to/agent-work-coordinator/scripts/coordinator.py wait --id "<work-
 
 After a queued path is promoted to checked out, commit and push the updated `LIBRARY.md`, then implement that path.
 
-8. When the entire implementation is complete, run finish:
+9. When the entire implementation is complete and all completed files have already been released and pushed, run finish:
 
 ```bash
 python3 /path/to/agent-work-coordinator/scripts/coordinator.py finish --id "<work-id>"
 ```
 
-This removes the active brief, releases all checked-out and queued paths for that work id, promotes first queued requests for released files, and appends the completed brief to `ARCHIVE.md`.
+This removes the active brief, releases any remaining checked-out or queued paths for that work id, promotes first queued requests for released files, and appends the completed brief to `ARCHIVE.md`.
 
-9. Commit and push the implemented files together with the final `LIBRARY.md` and `ARCHIVE.md` update:
+10. Commit and push the final `LIBRARY.md` and `ARCHIVE.md` update:
 
 ```bash
-git add <implemented-files> LIBRARY.md ARCHIVE.md
-git commit -m "<implementation summary>"
+git add LIBRARY.md ARCHIVE.md
+git commit -m "coord: finish <work-id>"
 git push
 ```
 
@@ -97,7 +112,7 @@ If the final push fails because the remote moved, do not discard implementation 
 
 ## Queue Semantics
 
-`LIBRARY.md` renders each unavailable queued path as `path/to/file (1)`, `path/to/file (2)`, and so on. When a checked-out file is released, `finish` removes the completed holder, promotes queue position `1` to a checkout with no number, and rerenders the remaining queue so numbers move down automatically.
+`LIBRARY.md` renders each unavailable queued path as `path/to/file (1)`, `path/to/file (2)`, and so on. Queue order and checkout ownership are stored by work id, while visible ownership is tagged with the agent label plus `agent_uuid`. When a checked-out file is released with `release` or `finish`, the coordinator removes the completed holder, promotes queue position `1` to a checkout with no number, and rerenders the remaining queue so numbers move down automatically.
 
 ## Manual Repair
 

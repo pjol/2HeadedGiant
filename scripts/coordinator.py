@@ -13,6 +13,7 @@ import secrets
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -84,6 +85,25 @@ def make_work_id(goal: str) -> str:
     return f"awc-{stamp}-{slugify(goal, 28)}-{secrets.token_hex(3)}"
 
 
+def make_agent_uuid() -> str:
+    return str(uuid.uuid4())
+
+
+def normalize_agent_uuid(raw: str) -> str:
+    try:
+        return str(uuid.UUID(raw.strip()))
+    except ValueError as exc:
+        raise ValueError(f"agent UUID must be a valid UUID: {raw}") from exc
+
+
+def agent_display(impl: dict[str, Any]) -> str:
+    label = impl.get("agent", "agent")
+    agent_uuid = impl.get("agent_uuid", "")
+    if not agent_uuid:
+        return label
+    return f"{label} [{agent_uuid}]"
+
+
 def load_state(library_path: Path) -> dict[str, Any]:
     if not library_path.exists():
         return default_state()
@@ -128,14 +148,19 @@ def clean_and_rebuild(state: dict[str, Any]) -> None:
     for work_id, impl in list(implementations.items()):
         impl.setdefault("id", work_id)
         impl.setdefault("agent", "agent")
+        impl.setdefault("agent_uuid", "")
         impl.setdefault("goal", "")
         impl.setdefault("started_at", utc_now())
         impl["planned_files"] = normalize_paths(list(impl.get("planned_files", [])))
+        impl["completed_files"] = normalize_paths(list(impl.get("completed_files", [])))
+        impl["completed_files"] = [path for path in impl["completed_files"] if path in impl["planned_files"]]
 
     normalized_checkouts: dict[str, str] = {}
     for raw_path, owner in list(state["checkouts"].items()):
         path = normalize_path(raw_path)
         if owner not in implementations or path not in implementations[owner]["planned_files"]:
+            continue
+        if path in implementations[owner].get("completed_files", []):
             continue
         normalized_checkouts[path] = owner
     state["checkouts"] = normalized_checkouts
@@ -151,6 +176,8 @@ def clean_and_rebuild(state: dict[str, Any]) -> None:
             impl = implementations.get(work_id)
             if not impl or path not in impl["planned_files"]:
                 continue
+            if path in impl.get("completed_files", []):
+                continue
             if state["checkouts"].get(path) == work_id:
                 continue
             queue.append(work_id)
@@ -161,8 +188,13 @@ def clean_and_rebuild(state: dict[str, Any]) -> None:
 
     for impl in implementations.values():
         planned = impl["planned_files"]
-        impl["checked_out"] = [path for path in planned if state["checkouts"].get(path) == impl["id"]]
-        impl["queued"] = [path for path in planned if impl["id"] in state["queues"].get(path, [])]
+        completed = set(impl.get("completed_files", []))
+        impl["checked_out"] = [
+            path for path in planned if path not in completed and state["checkouts"].get(path) == impl["id"]
+        ]
+        impl["queued"] = [
+            path for path in planned if path not in completed and impl["id"] in state["queues"].get(path, [])
+        ]
 
 
 def promote_queues(state: dict[str, Any]) -> None:
@@ -223,11 +255,13 @@ def render_library(state: dict[str, Any]) -> str:
             [
                 f"### `{impl['id']}`",
                 "",
-                f"- Agent: {impl.get('agent', 'agent')}",
+                f"- Agent: {agent_display(impl)}",
                 f"- Started: {impl.get('started_at', '')}",
                 f"- Goal: {impl.get('goal', '')}",
                 "- Planned paths:",
                 format_list(impl.get("planned_files", [])),
+                "- Completed paths:",
+                format_list(impl.get("completed_files", [])),
                 "- Checked-out paths:",
                 format_list(impl.get("checked_out", [])),
                 "- Queued paths:",
@@ -246,8 +280,9 @@ def render_library(state: dict[str, Any]) -> str:
         lines.extend(["_No checked-out files._", ""])
     else:
         for path, work_id in sorted(state["checkouts"].items()):
-            goal = state["implementations"].get(work_id, {}).get("goal", "")
-            lines.append(f"- `{path}` -> `{work_id}` ({goal})")
+            impl = state["implementations"].get(work_id, {})
+            goal = impl.get("goal", "")
+            lines.append(f"- `{path}` -> `{work_id}` by {agent_display(impl)} ({goal})")
         lines.append("")
 
     lines.extend(["## Queues", ""])
@@ -258,8 +293,9 @@ def render_library(state: dict[str, Any]) -> str:
         for path, queue in sorted(visible_queues.items()):
             lines.extend([f"### `{path}`", ""])
             for index, work_id in enumerate(queue, start=1):
-                goal = state["implementations"].get(work_id, {}).get("goal", "")
-                lines.append(f"- ({index}) `{work_id}` - {goal}")
+                impl = state["implementations"].get(work_id, {})
+                goal = impl.get("goal", "")
+                lines.append(f"- ({index}) `{work_id}` by {agent_display(impl)} - {goal}")
             lines.append("")
 
     return "\n".join(lines).rstrip() + "\n"
@@ -279,12 +315,14 @@ def archive_entry(impl: dict[str, Any], completed_at: str) -> str:
         "",
         f"## Completed {completed_at} - `{impl['id']}`",
         "",
-        f"- Agent: {impl.get('agent', 'agent')}",
+        f"- Agent: {agent_display(impl)}",
         f"- Started: {impl.get('started_at', '')}",
         f"- Completed: {completed_at}",
         f"- Goal: {impl.get('goal', '')}",
         "- Planned paths:",
         format_list(impl.get("planned_files", [])),
+        "- Completed paths:",
+        format_list(impl.get("completed_files", [])),
         "- Checked-out paths at completion:",
         format_list(impl.get("checked_out", [])),
         "- Queued paths at completion:",
@@ -332,6 +370,7 @@ def duplicate_candidates(
                     "id": other_id,
                     "goal": impl.get("goal", ""),
                     "agent": impl.get("agent", "agent"),
+                    "agent_uuid": impl.get("agent_uuid", ""),
                     "started_at": impl.get("started_at", ""),
                     "overlapping_files": file_overlap,
                     "similarity": round(token_overlap, 2),
@@ -347,12 +386,14 @@ def render_status(state: dict[str, Any], candidates: list[dict[str, Any]]) -> st
     if active:
         lines.append("Active implementations:")
         for work_id, impl in sorted(active.items()):
+            completed = ", ".join(impl.get("completed_files", [])) or "none"
             checked = ", ".join(impl.get("checked_out", [])) or "none"
             queued = []
             for path in impl.get("queued", []):
                 position = queue_position(state, path, work_id)
                 queued.append(f"{path} ({position})" if position else path)
-            lines.append(f"- {work_id}: {impl.get('goal', '')}")
+            lines.append(f"- {work_id} by {agent_display(impl)}: {impl.get('goal', '')}")
+            lines.append(f"  completed: {completed}")
             lines.append(f"  checked out: {checked}")
             lines.append(f"  queued: {', '.join(queued) or 'none'}")
     else:
@@ -362,7 +403,10 @@ def render_status(state: dict[str, Any], candidates: list[dict[str, Any]]) -> st
         lines.append("Potential duplicate briefs:")
         for candidate in candidates:
             overlap = ", ".join(candidate["overlapping_files"]) or "none"
-            lines.append(f"- {candidate['id']}: {candidate['goal']} (overlap: {overlap})")
+            candidate_agent = candidate["agent"]
+            if candidate["agent_uuid"]:
+                candidate_agent = f"{candidate_agent} [{candidate['agent_uuid']}]"
+            lines.append(f"- {candidate['id']} by {candidate_agent}: {candidate['goal']} (overlap: {overlap})")
     return "\n".join(lines)
 
 
@@ -385,6 +429,7 @@ def cmd_status(args: argparse.Namespace) -> int:
 def cmd_request(args: argparse.Namespace) -> int:
     files = normalize_paths(args.files)
     work_id = args.id or make_work_id(args.goal)
+    requested_agent_uuid = normalize_agent_uuid(args.agent_uuid) if args.agent_uuid else None
     library_path = Path(args.library)
     state = load_state(library_path)
     promote_queues(state)
@@ -393,7 +438,8 @@ def cmd_request(args: argparse.Namespace) -> int:
     if work_id in implementations:
         impl = implementations[work_id]
         old_files = set(impl.get("planned_files", []))
-        new_files = set(files)
+        planned_files = normalize_paths(list(impl.get("planned_files", [])) + files)
+        new_files = set(planned_files)
         for path, owner in list(state["checkouts"].items()):
             if owner == work_id and path not in new_files:
                 del state["checkouts"][path]
@@ -402,23 +448,29 @@ def cmd_request(args: argparse.Namespace) -> int:
             if not state["queues"][path]:
                 del state["queues"][path]
         impl["agent"] = args.agent
+        impl["agent_uuid"] = requested_agent_uuid or impl.get("agent_uuid") or make_agent_uuid()
         impl["goal"] = args.goal
-        impl["planned_files"] = files
+        impl["planned_files"] = planned_files
+        impl["completed_files"] = [path for path in impl.get("completed_files", []) if path in new_files]
         if old_files != new_files:
             impl["updated_at"] = utc_now()
     else:
         impl = {
             "id": work_id,
             "agent": args.agent,
+            "agent_uuid": requested_agent_uuid or make_agent_uuid(),
             "goal": args.goal,
             "started_at": utc_now(),
             "planned_files": files,
+            "completed_files": [],
             "checked_out": [],
             "queued": [],
         }
         implementations[work_id] = impl
 
     for path in files:
+        if path in set(impl.get("completed_files", [])):
+            continue
         owner = state["checkouts"].get(path)
         queue = state["queues"].setdefault(path, [])
         if owner == work_id:
@@ -443,7 +495,10 @@ def cmd_request(args: argparse.Namespace) -> int:
     result_impl = state["implementations"][work_id]
     result = {
         "id": work_id,
+        "agent": result_impl["agent"],
+        "agent_uuid": result_impl["agent_uuid"],
         "goal": result_impl["goal"],
+        "completed_files": result_impl.get("completed_files", []),
         "checked_out": result_impl.get("checked_out", []),
         "queued": [
             {"path": path, "position": queue_position(state, path, work_id)}
@@ -451,6 +506,65 @@ def cmd_request(args: argparse.Namespace) -> int:
         ],
     }
     print(json.dumps(result, indent=2, sort_keys=True))
+    return 0
+
+
+def cmd_release(args: argparse.Namespace) -> int:
+    files = normalize_paths(args.files)
+    library_path = Path(args.library)
+    state = load_state(library_path)
+    promote_queues(state)
+    impl = state["implementations"].get(args.id)
+    if not impl:
+        raise SystemExit(f"No active implementation with id {args.id!r}.")
+
+    planned = set(impl.get("planned_files", []))
+    completed = list(impl.get("completed_files", []))
+    completed_set = set(completed)
+    released: list[str] = []
+    already_completed: list[str] = []
+
+    for path in files:
+        if path not in planned:
+            raise SystemExit(f"{path!r} is not planned for implementation {args.id!r}.")
+        if path in completed_set:
+            already_completed.append(path)
+            continue
+        owner = state["checkouts"].get(path)
+        if owner != args.id:
+            raise SystemExit(f"{path!r} is not checked out by implementation {args.id!r}.")
+        del state["checkouts"][path]
+        for queued_path, queue in list(state["queues"].items()):
+            if queued_path == path:
+                state["queues"][queued_path] = [work_id for work_id in queue if work_id != args.id]
+                if not state["queues"][queued_path]:
+                    del state["queues"][queued_path]
+        completed.append(path)
+        completed_set.add(path)
+        released.append(path)
+
+    impl["completed_files"] = completed
+    impl["updated_at"] = utc_now()
+    promote_queues(state)
+    save_library(library_path, state)
+    result_impl = state["implementations"][args.id]
+    print(
+        json.dumps(
+            {
+                "id": args.id,
+                "released": released,
+                "already_completed": already_completed,
+                "completed_files": result_impl.get("completed_files", []),
+                "checked_out": result_impl.get("checked_out", []),
+                "queued": [
+                    {"path": path, "position": queue_position(state, path, args.id)}
+                    for path in result_impl.get("queued", [])
+                ],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
     return 0
 
 
@@ -462,16 +576,23 @@ def cmd_finish(args: argparse.Namespace) -> int:
     impl = state["implementations"].get(args.id)
     if not impl:
         raise SystemExit(f"No active implementation with id {args.id!r}.")
-    archived_impl = copy.deepcopy(impl)
     completed_at = utc_now()
 
+    completed = list(impl.get("completed_files", []))
+    completed_set = set(completed)
     for path, owner in list(state["checkouts"].items()):
         if owner == args.id:
+            if path not in completed_set:
+                completed.append(path)
+                completed_set.add(path)
             del state["checkouts"][path]
     for path, queue in list(state["queues"].items()):
         state["queues"][path] = [work_id for work_id in queue if work_id != args.id]
         if not state["queues"][path]:
             del state["queues"][path]
+    impl["completed_files"] = completed
+    promote_queues(state)
+    archived_impl = copy.deepcopy(impl)
     del state["implementations"][args.id]
     promote_queues(state)
     save_library(library_path, state)
@@ -502,6 +623,9 @@ def cmd_wait(args: argparse.Namespace) -> int:
                 json.dumps(
                     {
                         "id": args.id,
+                        "agent": impl.get("agent", "agent"),
+                        "agent_uuid": impl.get("agent_uuid", ""),
+                        "completed_files": impl.get("completed_files", []),
                         "checked_out": impl.get("checked_out", []),
                         "queued": [
                             {"path": path, "position": queue_position(state, path, args.id)}
@@ -531,9 +655,15 @@ def build_parser() -> argparse.ArgumentParser:
     request = subparsers.add_parser("request", help="Request checkouts or queue unavailable files")
     request.add_argument("--id", help="Stable work id. Generated if omitted.")
     request.add_argument("--agent", default=os.environ.get("USER", "agent"), help="Agent or user label")
+    request.add_argument("--agent-uuid", help="Stable UUID for this agent instance. Generated if omitted.")
     request.add_argument("--goal", required=True, help="Brief implementation goal")
     request.add_argument("--files", nargs="+", required=True, help="Repo-relative files to reserve")
     request.set_defaults(func=cmd_request)
+
+    release = subparsers.add_parser("release", help="Release completed checked-out files and promote queues")
+    release.add_argument("--id", required=True, help="Work id releasing files")
+    release.add_argument("--files", nargs="+", required=True, help="Checked-out files completed by this work id")
+    release.set_defaults(func=cmd_release)
 
     finish = subparsers.add_parser("finish", help="Release active work and append it to ARCHIVE.md")
     finish.add_argument("--archive", default=DEFAULT_ARCHIVE, help="Path to ARCHIVE.md")
