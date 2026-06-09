@@ -26,6 +26,12 @@ The repository should contain a durable note telling future agents to download a
 
 If no guidance file exists, create `AGENTS.md` at the repository root unless the repo has a clearer convention. If `LIBRARY.md` already exists, reserve the note file through the normal checkout process before editing it. If bootstrapping the protocol for the first time, add the note and initial `LIBRARY.md` in the same coordination commit.
 
+## Reserved Branches
+
+Treat `main`, `dev`, and project-specific production/development trunk branches identified by repo guidance, deployment config, branch policy, or naming convention as reserved. These branches often trigger automatic production or development deployment, so coordination pushes count as work on a reserved branch.
+
+Before running `request`, `checkin`, `release`, `finish`, or any other command that will be committed and pushed, check the current branch with `git branch --show-current`. If it is reserved, stop and tell the user to create or switch to a feature branch, for example `git switch -c <short-feature-branch>`. Reserved branches should only receive manual deploy or release actions when the user explicitly asks for them.
+
 ## Work Ids
 
 Use stable ids for the entire prompt, for example `awc-20260602-fix-login-state`. Reuse the same id when a checkout push races and must be retried. Do not generate a new id for the same implementation unless the original id was never pushed and never archived.
